@@ -33,15 +33,154 @@ Medical report generation from X-ray images is a critical task that requires:
 
 ### Model Architecture Details
 
+![](Assets/2025-06-22-22-08-55.png)
+
+### 🔬 Detailed Architecture Explanation
+
+#### **1. Vision Processing Pipeline**
+
+**DenseNet-121 Encoder:**
+- Takes chest X-ray images as input (224×224×3 RGB)
+- Extracts hierarchical features through dense connections
+- Outputs feature maps of size (batch_size, 1024, 7, 7)
+- Features are flattened to (batch_size, 49, 1024) for attention processing
+
+**Attention Module:**
+```python
+class AttentionModule(nn.Module):
+    def __init__(self, in_features, num_diseases, num_patches):
+        # Learnable attention weights for each disease
+        self.attention_weights = nn.Parameter(torch.randn(num_diseases, num_patches, 1))
+    
+    def forward(self, x):
+        # Apply softmax to get attention distribution
+        attention_weights = torch.softmax(self.attention_weights, dim=1)
+        # Weighted combination of visual features per disease
+        attended_features = torch.einsum('bpc,pdc->bdc', x, attention_weights)
+        return attended_features, attention_weights
 ```
-Input X-ray → DenseNet-121 → Attention Module → Visual Features
-                                                    ↓
-Diagnostic Prompt → Llama-2-7B → Text Embeddings → Fusion Layer
-                                                    ↓
-                                              Combined Embeddings
-                                                    ↓
-                                              Report Generation
+
+**Key Insight:** The attention mechanism learns disease-specific spatial attention patterns, allowing the model to focus on relevant regions for each of the 14 disease categories.
+
+#### **2. Language Model Processing**
+
+**Llama-2-7B with QLoRA:**
+- Uses 4-bit quantization (NF4) to reduce memory footprint
+- LoRA adapters target attention layers: `["q_proj","k_proj","v_proj","o_proj"]`
+- Processes diagnostic prompts and generates medical reports
+- Maintains causal language modeling capabilities
+
+**QLoRA Configuration:**
+```python
+lora_r = 8          # Rank of LoRA adapters
+lora_alpha = 8      # Scaling factor
+lora_dropout = 0.1  # Dropout for regularization
 ```
+
+#### **3. Multimodal Fusion Mechanism**
+
+**PreCarDiv Model Architecture:**
+```python
+class Model_PreCarDiv(nn.Module):
+    def __init__(self, visual_feature_dim, llm_model):
+        # Linear projection to match LLM hidden dimension
+        self.visual_projection = nn.Linear(visual_feature_dim, llm_model.config.hidden_size)
+    
+    def prepare_features(self, visual_features, input_ids):
+        # 1. Reshape visual features: (batch, 14_diseases, 1024) → (batch*14, 1024)
+        visual_features_reshaped = visual_features.view(batch_size * num_diseases, -1)
+        
+        # 2. Project to LLM dimension: (batch*14, 1024) → (batch*14, 4096)
+        visual_embeddings_reshaped = self.visual_projection(visual_features_reshaped)
+        
+        # 3. Reshape back: (batch*14, 4096) → (batch, 14, 4096)
+        visual_embeddings = visual_embeddings_reshaped.view(batch_size, num_diseases, -1)
+        
+        # 4. Get text embeddings from LLM
+        text_embeddings = self.llm_model.get_input_embeddings()(input_ids)
+        
+        # 5. Concatenate: (batch, 14+seq_len, 4096)
+        combined_embeddings = torch.cat((visual_embeddings, text_embeddings), dim=1)
+        
+        return visual_features, combined_embeddings
+```
+
+#### **4. How Multimodal Fusion Works**
+
+**Step-by-Step Process:**
+
+1. **Visual Feature Extraction:**
+   - X-ray image → DenseNet-121 → 1024-dimensional features per spatial location
+   - Attention mechanism applies disease-specific weights to spatial regions
+   - Results in 14 disease-specific feature vectors per image
+
+2. **Feature Alignment:**
+   - Visual features (1024-dim) are projected to LLM hidden dimension (4096-dim)
+   - This ensures compatibility between vision and language representations
+   - Maintains disease-specific structure through reshaping operations
+
+3. **Temporal Fusion:**
+   - Visual features are prepended to text embeddings
+   - Sequence: [Visual_Disease_1, Visual_Disease_2, ..., Visual_Disease_14, Text_Tokens]
+   - LLM processes the combined sequence as a single input
+
+4. **Attention-Based Integration:**
+   - LLM's self-attention mechanism naturally attends to both visual and textual tokens
+   - Cross-modal attention allows text generation to be influenced by visual features
+   - Disease-specific visual features guide report generation
+
+#### **5. Training Strategy**
+
+**Custom Loss Function:**
+```python
+def compute_loss(self, model, inputs, return_outputs=False):
+    visual_features = inputs['visual_features'].to(device)
+    input_ids = inputs['input_ids'].to(device)
+    attention_mask = inputs['attention_mask'].to(device)
+    labels = inputs['labels'].to(device)
+    
+    # Forward pass through multimodal model
+    outputs = model(visual_features, input_ids, attention_mask, labels)
+    loss = outputs.loss  # Standard causal language modeling loss
+    
+    return (loss, outputs) if return_outputs else loss
+```
+
+**Key Training Aspects:**
+- **Label Masking:** Only target report tokens contribute to loss (visual tokens masked with -100)
+- **Gradient Flow:** Gradients flow through both vision and language components
+- **End-to-End:** All components are trained simultaneously for optimal integration
+
+#### **6. Inference Process**
+
+**Report Generation:**
+```python
+def generate(self, visual_features, input_ids, attention_mask, max_length=512):
+    # 1. Prepare multimodal embeddings
+    _, combined_embeddings = self.prepare_features(visual_features, input_ids)
+    
+    # 2. Generate text using LLM with visual context
+    generated_ids = self.llm_model.generate(
+        inputs_embeds=combined_embeddings,
+        attention_mask=attention_mask,
+        max_length=max_length,
+        num_beams=5,  # Beam search for better quality
+        early_stopping=True,
+        no_repeat_ngram_size=2
+    )
+    
+    return generated_ids
+```
+
+**Why This Architecture Works:**
+
+1. **Disease-Specific Attention:** The attention mechanism allows the model to focus on different image regions for different diseases, mimicking radiologist behavior.
+
+2. **Seamless Integration:** By projecting visual features to the same dimension as text embeddings, the LLM can naturally process both modalities.
+
+3. **Contextual Generation:** The LLM generates reports with full awareness of both the visual findings and the diagnostic prompt.
+
+4. **Parameter Efficiency:** QLoRA allows fine-tuning of the large LLM with minimal additional parameters while maintaining performance.
 
 ## 📊 Dataset
 
@@ -211,18 +350,3 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - **Meta AI** for Llama-2-7B model
 - **CheXpert+** dataset contributors
 - **PyTorch** community for deep learning framework
-
-## 📞 Contact
-
-- **Email**: charangajjala7@gmail.com
-- **GitHub**: [@charangajjala](https://github.com/charangajjala)
-
-## 🔗 Links
-
-- **Repository**: https://github.com/charangajjala/MedGen_AI
-- **Hugging Face**: https://huggingface.co/meta-llama/Llama-2-7b-hf
-- **Dataset**: CheXpert+ (requires access permissions)
-
----
-
-**Note**: This project requires appropriate access permissions for the Llama-2-7B model and medical datasets. Please ensure compliance with data usage agreements and medical data privacy regulations. 
